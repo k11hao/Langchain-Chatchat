@@ -1,3 +1,8 @@
+from fastapi import Body,Request
+from fastapi.responses import StreamingResponse
+from configs.model_config import chat_list
+from langchain import LLMChain
+from configs import LLM_MODELS,Default_LLM_MODEL, TEMPERATURE
 from fastapi import Body
 from sse_starlette.sse import EventSourceResponse
 from configs import LLM_MODELS, TEMPERATURE
@@ -90,6 +95,8 @@ async def chat(query: str = Body(..., description="用户输入", examples=["恼
                 yield json.dumps(
                     {"text": token, "message_id": message_id},
                     ensure_ascii=False)
+                data = json.dumps({"answer": token}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
         else:
             answer = ""
             async for token in callback.aiter():
@@ -97,7 +104,71 @@ async def chat(query: str = Body(..., description="用户输入", examples=["恼
             yield json.dumps(
                 {"text": answer, "message_id": message_id},
                 ensure_ascii=False)
+            yield json.dumps({"answer": answer,},
+                             ensure_ascii=False)
 
         await task
 
     return EventSourceResponse(chat_iterator())
+
+
+def chat_n(uid: str, request: Request):
+
+    param = chat_list[uid]
+    query = param['query']
+    history = param['history']
+    stream = True
+    # top_k = 5
+
+    del chat_list[uid]
+    history = [History.from_data(h) for h in history]
+
+    async def chat_iteratorn(query: str,
+                            history: List[History] = [],
+                            model_name: str = LLM_MODELS,
+                            prompt_name: str = "default",
+                            ) -> AsyncIterable[str]:
+        callback = AsyncIteratorCallbackHandler()
+        model = get_ChatOpenAI(
+            model_name=model_name,
+            temperature=0.7,
+            callbacks=[callback],
+        )
+
+        prompt_template = get_prompt_template("llm_chat", prompt_name)
+        input_msg = History(role="user", content=prompt_template).to_msg_template(False)
+        chat_prompt = ChatPromptTemplate.from_messages(
+            [i.to_msg_template() for i in history] + [input_msg])
+        chain = LLMChain(prompt=chat_prompt, llm=model)
+
+        # Begin a task that runs in the background.
+        task = asyncio.create_task(wrap_done(
+            chain.acall({"input": query}),
+            callback.done),
+        )
+
+        yield f"event: start\ndata:  \n\n"
+        if stream:
+            async for token in callback.aiter():
+                # Use server-sent-events to stream the response
+                data = json.dumps({"answer": token}, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+        else:
+            answer = ""
+            async for token in callback.aiter():
+                answer += token
+            yield json.dumps({"answer": answer, },
+                             ensure_ascii=False)
+
+        data = json.dumps({"answer": ""},
+                          ensure_ascii=False)
+        yield f"event: done\ndata: {data}\n\n"
+        await task
+
+    return StreamingResponse(chat_iteratorn(query=query,
+                                           history=history,
+                                           model_name=Default_LLM_MODEL,
+                                           prompt_name='default'),
+                             media_type="text/event-stream")
+
+    #chat(query=query, history=history, stream=stream)
